@@ -2,6 +2,12 @@
 
 A PyTorch implementation of GPT-2 style transformer with modern training optimizations. This implementation follows the architecture described in the GPT-2 paper while incorporating various performance enhancements for efficient training.
 
+**HuggingFace Demo**: [https://huggingface.co/spaces/dhairyashil/ShakespeareGPT-Forge](https://huggingface.co/spaces/dhairyashil/ShakespeareGPT-Forge)
+
+## Training Curves 
+
+![Training Curves](./training_curves.png)
+
 ## Features
 
 ### Architecture
