@@ -215,6 +215,15 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
+    def save_checkpoint(self, optimizer, loss, step, filename):
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': loss,
+            'step': step
+        }
+        torch.save(checkpoint, filename)
+
 # model = GPT.from_pretrained('gpt2')
 
 device = 'cpu'
@@ -273,10 +282,11 @@ model.to(device)
 # model = torch.compile(model)
 
 # CODE UPDATE HERE
-max_lr = 6e-4 
+max_lr = 1e-3  # Increased from 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 100  # Increased warmup
+max_steps = 500
+gradient_accumulation_steps = 4  # New parameter
 
 def get_lr(it):
     if it < warmup_steps:
@@ -288,42 +298,109 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-train_loader = DataLoaderLite(B = 16, T = 1024)
+train_loader = DataLoaderLite(B=32, T=1024)  # Increased batch size from 16 to 32
 
 # NEW CODE
 import time
-# optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+
+# Initialize scaler only for CUDA
+scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
+best_loss = float('inf')
+
+def print_model_summary(model):
+    """Print model summary including parameter count and layer information"""
+    print("\nModel Summary:")
+    print("=" * 50)
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"\nTotal Parameters: {total_params:,}")
+    print(f"Trainable Parameters: {trainable_params:,}")
+    print(f"Non-trainable Parameters: {total_params - trainable_params:,}")
+    
+    print("\nLayer Details:")
+    print("-" * 50)
+    for name, module in model.named_children():
+        params = sum(p.numel() for p in module.parameters())
+        print(f"{name}: {module.__class__.__name__} ({params:,} parameters)")
+        if name == 'transformer':
+            for sub_name, sub_module in module.named_children():
+                sub_params = sum(p.numel() for p in sub_module.parameters())
+                print(f"  └─{sub_name}: {sub_module.__class__.__name__} ({sub_params:,} parameters)")
+                if sub_name == 'h':
+                    print("    └─Transformer Blocks:")
+                    for i, block in enumerate(sub_module):
+                        block_params = sum(p.numel() for p in block.parameters())
+                        print(f"      └─Block {i}: ({block_params:,} parameters)")
+    
+    print("\nModel Architecture:")
+    print("-" * 50)
+    print(model)
+    print("=" * 50)
+
+print_model_summary(model)
+print("\nStarting training...\n")
+
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     
-    # Conditional autocast based on device type
-    if device == 'cuda':
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    # Gradient accumulation loop
+    accumulated_loss = 0
+    for accum_step in range(gradient_accumulation_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        
+        if device == 'cuda':
+            # Use autocast only for CUDA
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+                loss = loss / gradient_accumulation_steps
+                accumulated_loss += loss.item()
+                scaler.scale(loss).backward()
+        else:
+            # For CPU and MPS, just do regular forward pass
             logits, loss = model(x, y)
-    else:
-        # For CPU and MPS, run without autocast
-        logits, loss = model(x, y)
+            loss = loss / gradient_accumulation_steps
+            accumulated_loss += loss.item()
+            loss.backward()
     
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
+    # Clip gradients
+    if device == 'cuda':
+        scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    
+    # Update learning rate
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-        
-    optimizer.step()
     
-    # Only synchronize if using CUDA
+    # Optimizer step
+    if device == 'cuda':
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    
+    # Synchronize if needed
     if device == 'cuda':
         torch.cuda.synchronize()
+    elif device == 'mps':
+        torch.mps.synchronize()
     
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f'step{step} | loss: {loss.item()} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec: .2f} | norm: {norm:.2f}')
+    tokens_per_sec = (train_loader.B * train_loader.T * gradient_accumulation_steps) / (t1 - t0)
+    
+    # Save best model
+    if accumulated_loss < best_loss:
+        best_loss = accumulated_loss
+        model.save_checkpoint(optimizer, accumulated_loss, step, 'best_model.pt')
+    
+    if step % 10 == 0:  # Print every 10 steps
+        print(f'step {step} | loss: {accumulated_loss:.4f} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f} | norm: {norm:.2f} | lr: {lr:.6f}')
 
 
 print(loss)
