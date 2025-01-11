@@ -1,3 +1,9 @@
+"""
+Implementation of a GPT-style transformer model with optimizations for training speed and efficiency.
+This implementation follows the architecture described in the GPT-2 paper while incorporating
+modern training techniques like gradient accumulation, mixed precision training, and cosine learning rate scheduling.
+"""
+
 # GPT-3 Paper 
 # add cosing delay  
 import os
@@ -10,6 +16,21 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
+"""
+The CausalSelfAttention module implements the core self-attention mechanism used in GPT models.
+Key features:
+- Uses Flash Attention for optimized performance on modern GPUs
+- Implements causal (masked) attention to prevent looking at future tokens
+- Projects input into Query, Key and Value matrices in a batched operation
+- Scales attention scores by 1/sqrt(head_size) to maintain stable gradients
+- Supports multi-head attention for parallel attention computations
+
+Architecture details:
+- Input is split into Q/K/V projections using a single linear layer for efficiency
+- Attention scores are computed as scaled dot products between Q and K
+- V is then weighted by the attention scores to produce the output
+- Final projection layer combines multi-head outputs
+"""
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -49,6 +70,17 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+"""
+The MLP module implements the feed-forward network component of each transformer block.
+Design choices:
+- Uses 4x expansion in hidden layer (standard in transformer architectures)
+- GELU activation with tanh approximation for better performance
+- Special initialization scaling for deeper networks
+- Projection back to original dimension with careful initialization
+
+The 4x expansion allows the network to learn more complex token interactions
+while the GELU activation provides non-linearity with better gradients than ReLU.
+"""
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -64,6 +96,16 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+"""
+The Block module combines self-attention and MLP layers into a transformer block.
+Key features:
+- Layer normalization before each sub-component (pre-norm formulation)
+- Residual connections around both attention and MLP
+- Careful initialization for stable training of deep networks
+
+This implementation uses the pre-norm formulation which has been shown to enable
+better training of deep transformers compared to the post-norm variant.
+"""
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -79,6 +121,17 @@ class Block(nn.Module):
         return x
 
 
+"""
+GPTConfig defines the architectural hyperparameters for the model.
+The defaults match GPT-2 small (124M parameters):
+- 12 layers with 12 attention heads
+- 768 embedding dimension
+- 1024 sequence length
+- ~50k vocab size (GPT-2 BPE tokenizer)
+
+These parameters can be scaled up to match larger GPT-2 variants
+like medium (350M), large (774M), or XL (1.5B).
+"""
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
@@ -88,6 +141,28 @@ class GPTConfig:
     n_embd: int = 768 # embedding dimension
 
 
+"""
+The main GPT model implementation combining all components into a full language model.
+Key features:
+- Token + positional embeddings shared with output layer
+- Stack of transformer blocks
+- Final layer norm and projection to vocab size
+- Weight initialization scaled by network depth
+- Optimized training with AdamW and weight decay
+
+The model supports:
+- Pretrained weight loading from Hugging Face
+- Mixed precision training
+- Gradient accumulation
+- Learning rate scheduling
+- Checkpoint saving/loading
+
+Training optimizations:
+- Uses fused AdamW when available
+- Separates weight decay and non-weight decay params
+- Implements cosine learning rate schedule with warmup
+- Gradient clipping for stability
+"""
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -246,6 +321,17 @@ max_length = 30
 
 import tiktoken
 
+"""
+DataLoaderLite provides efficient batched data loading for training.
+Design choices:
+- Loads full dataset into memory for maximum throughput
+- Uses tiktoken for fast tokenization
+- Provides circular iteration through the dataset
+- Returns batched inputs and shifted targets for language modeling
+
+The loader maintains its state between batches and automatically
+resets when reaching the end of the dataset.
+"""
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -343,6 +429,28 @@ def print_model_summary(model):
 print_model_summary(model)
 print("\nStarting training...\n")
 
+"""
+Training loop implementation with modern optimization techniques:
+- Gradient accumulation for effective larger batch sizes
+- Mixed precision training using torch.cuda.amp
+- Cosine learning rate schedule with warmup
+- Model checkpointing based on loss
+- Detailed progress monitoring and logging
+- Automatic device placement (CPU/CUDA/MPS)
+
+Performance optimizations:
+- Uses high precision matrix multiplications
+- Implements gradient clipping for stability
+- Synchronizes CUDA operations for accurate timing
+- Tracks tokens/second for throughput monitoring
+
+The training loop provides comprehensive logging of:
+- Loss values
+- Learning rates
+- Gradient norms
+- Training speed (tokens/second)
+- Time per batch
+"""
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
